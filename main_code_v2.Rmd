@@ -1,0 +1,310 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Setup
+```{r}
+# Load required libraries
+library(dplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(plm)        # panel estimation
+library(lmtest)     # coeftest
+library(sandwich)   # vcovHC
+```
+
+```{r}
+# Set paths
+data_directory <- "data/bres/"
+output_directory <- "output/"
+
+# Create output directory
+if (!dir.exists(output_directory)) dir.create(output_directory, recursive = TRUE)
+```
+
+# Data Processing
+
+```{r}
+cat("Starting employment data processing...\n")
+
+# Load and combine all CSV files
+cat("Loading CSV files...\n")
+raw_data <- list.files(data_directory, pattern = "\\.csv$", full.names = TRUE) %>%
+  map_dfr(~read_csv(.x, col_types = cols(.default = "c"), show_col_types = FALSE))
+
+cat("Loaded", nrow(raw_data), "rows from", 
+    length(list.files(data_directory, pattern = "\\.csv$")), "files\n")
+
+# Clean and standardize data
+cat("Cleaning data...\n")
+cleaned_data <- raw_data %>%
+  mutate(
+    date = as.numeric(DATE),
+    region = str_trim(GEOGRAPHY_NAME),
+    industry = str_trim(INDUSTRY_NAME),
+    employment = as.numeric(OBS_VALUE)
+  ) %>%
+  filter(
+    !is.na(date),
+    !is.na(region), 
+    !is.na(industry),
+    !is.na(employment),
+    employment > 0,
+    str_detect(EMPLOYMENT_STATUS_NAME, "Employ")
+  ) %>%
+  select(date, region, industry, employment) %>%
+  arrange(date, region, industry)
+
+cat("Cleaned data:", nrow(cleaned_data), "rows\n")
+cat("Years:", min(cleaned_data$date), "to", max(cleaned_data$date), "\n")
+cat("Regions:", n_distinct(cleaned_data$region), "\n")
+cat("Industries:", n_distinct(cleaned_data$industry), "\n")
+
+# Create regional summary
+regional_summary <- cleaned_data %>%
+  group_by(date, region) %>%
+  summarise(
+    total_employment = sum(employment),
+    num_industries = n_distinct(industry),
+    .groups = "drop"
+  )
+
+# Create time series matrix
+employment_time_series <- cleaned_data %>%
+  group_by(date, region) %>%
+  summarise(total_employment = sum(employment), .groups = "drop") %>%
+  pivot_wider(names_from = region, values_from = total_employment) %>%
+  arrange(date)
+```
+#### Related and Unrelated Variety Indexes ####
+
+SIC method
+```{r}
+cat("Calculating variety indexes (conventional SIC-based method)...\n")
+
+# Prepare data with industry classification levels
+employment_with_codes <- cleaned_data %>%
+  mutate(
+    # extract numeric SIC code (assumes it starts each string)
+    sic_code      = str_extract(industry, "^\\d{4}"),     # 4‑digit
+    industry_4dig = sic_code,
+    industry_2dig = str_sub(sic_code, 1, 2)
+  ) %>%
+  filter(!is.na(industry_2dig)) %>%
+  group_by(date, region) %>%
+  mutate(
+    total_emp      = sum(employment),
+    share_4dig     = employment / total_emp
+  ) %>%
+  ungroup()
+
+
+# Related Variety (RV) – within 2‑digit groups
+rv_tbl <- employment_with_codes %>%
+  group_by(date, region, industry_2dig) %>%
+  mutate(
+    group_share        = sum(share_4dig),
+    within_shares      = share_4dig / group_share,
+    within_entropy_4d  = ifelse(group_share > 0,
+                                -within_shares * log2(within_shares + 1e-12), 0)
+  ) %>%
+  summarise(
+    weighted_entropy = sum(within_entropy_4d),       # Σ p_i log p_i inside each 2‑digit
+    group_share      = unique(group_share),
+    .groups = "drop"
+  ) %>%
+  group_by(date, region) %>%
+  summarise(
+    related_variety = sum(group_share * weighted_entropy),
+    .groups = "drop"
+  )
+
+# Unrelated Variety (UV) – across 2‑digit groups
+uv_tbl <- employment_with_codes %>%
+  group_by(date, region, industry_2dig) %>%
+  summarise(group_share = sum(share_4dig), .groups = "drop") %>%
+  group_by(date, region) %>%
+  summarise(
+    unrelated_variety = -sum(group_share * log2(group_share + 1e-12)),
+    .groups = "drop"
+  )
+
+# Total Variety (TV) across all 4‑digit industries
+tv_tbl <- employment_with_codes %>%
+  group_by(date, region) %>%
+  summarise(
+    total_variety = -sum(share_4dig * log2(share_4dig + 1e-12)),
+    .groups = "drop"
+  )
+
+# Merge & sense check
+variety_indexes <- rv_tbl %>%
+  left_join(uv_tbl, by = c("date", "region")) %>%
+  left_join(tv_tbl, by = c("date", "region")) %>%
+  mutate(check_tv = abs(total_variety - (related_variety + unrelated_variety)) < 1e-8) # should be true for every region-time combo
+
+# 4-year rolling mean (unweighted) for each region
+avg_1519 <- variety_indexes %>% 
+  filter(date %in% 2015:2019) %>% 
+  group_by(region) %>% 
+  summarise(
+    RV_avg = mean(related_variety),
+    UV_avg = mean(unrelated_variety),
+    TV_avg = mean(total_variety)) %>%
+  mutate(check_tv = abs(TV_avg - (RV_avg + UV_avg)) < 1e-8) # TRUE for every combo as above
+
+```
+
+#### Dynamic Shift-Share estimates ####
+
+```{r}
+# Helper
+compute_growth <- function(start, end) {
+  (end - start) / ifelse(start == 0, NA, start)
+}
+
+compute_shiftshare <- function(df, start_year, end_year, phase_name) {
+  # snapshots
+  base <- df %>% filter(date == start_year)
+  end  <- df %>% filter(date == end_year)
+
+  # national growth
+  g_nat <- compute_growth(sum(base$employment), sum(end$employment))
+
+  g_nat_i <- base %>%
+    group_by(industry) %>% summarise(E_i0 = sum(employment), .groups="drop") %>%
+    left_join(end  %>% group_by(industry) %>% summarise(E_i1 = sum(employment), .groups="drop"),
+              by = "industry") %>%
+    mutate(g_nat_i = compute_growth(E_i0, E_i1)) %>%
+    select(industry, g_nat_i)
+
+  # region–industry growth
+  g_ri <- base %>%
+    select(region, industry, emp0 = employment) %>%
+    left_join(end %>% select(region, industry, emp1 = employment),
+              by = c("region", "industry")) %>%
+    mutate(g_ri = compute_growth(emp0, emp1))
+
+  # regional totals
+  base_reg <- base %>% group_by(region) %>% summarise(E_start = sum(employment), .groups="drop")
+  end_reg  <- end  %>% group_by(region) %>% summarise(E_end   = sum(employment), .groups="drop")
+
+  # shift–share terms
+  ss <- g_ri %>%
+    left_join(g_nat_i, by = "industry") %>%
+    left_join(base_reg, by = "region") %>%
+    mutate(
+      NE = E_start * g_nat,
+      IM = emp0 * (g_nat_i - g_nat),
+      CE = emp0 * (g_ri   - g_nat_i)
+    ) %>%
+    group_by(region) %>%
+    summarise(
+      NE  = unique(NE),
+      IM  = sum(IM, na.rm = TRUE),
+      CE  = sum(CE, na.rm = TRUE),
+      E_start = unique(E_start),
+      .groups = "drop"
+    ) %>%
+    left_join(end_reg, by = "region") %>%
+    mutate(
+      delta_emp = E_end - E_start,
+      phase     = phase_name,
+      start_year = start_year,
+      end_year   = end_year
+    )
+  ss
+}
+
+# run for each phase
+phases <- list(
+  list(s = 2019, e = 2020, name = "2019_20"),
+  list(s = 2020, e = 2022, name = "2020_22")
+)
+
+shiftshare_results <- purrr::map_dfr(phases, ~compute_shiftshare(cleaned_data, .x$s, .x$e, .x$name))
+
+# normalise outputs for regression
+shiftshare_scaled <- shiftshare_results %>%
+  mutate(
+    CE_prop    = CE / E_start,
+    IM_prop    = IM / E_start,
+    NE_prop    = NE / E_start,
+    delta_prop = delta_emp / E_start
+  )
+```
+
+#### CE regression ####
+
+```{r}
+# Merge CE + variety
+panel_df <- shiftshare_scaled %>%
+  left_join(avg_1519, by = "region") %>%
+  mutate(
+    phase_dummy = ifelse(phase == "2020_22", 1, 0),
+    RV_int      = RV_avg * phase_dummy,   # interaction term
+    UV_int      = UV_avg * phase_dummy
+  )
+
+# Set up panel data frame
+# two periods per region → indexed by (region, phase)
+plm_df <- pdata.frame(panel_df, index = c("region", "phase"))
+
+# Fixed‑effects (within) estimator
+fe_mod <- plm(CE_prop ~ RV_avg + UV_avg + IM_prop + phase_dummy + RV_int + UV_int,
+             data = plm_df, model = "within", effect = "individual")
+
+#  Cluster‑robust SEs
+coefs <- coeftest(fe_mod, vcov = vcovHC(fe_mod, type = "HC1", cluster = "group"))
+print(coefs)
+
+# Save results
+results_path <- file.path(output_directory, "ce_rv_regression_results.csv")
+write.csv(as.data.frame(coefs), results_path, row.names = TRUE)
+cat("Results saved to", results_path, "\n")
+
+```
+
+```{r}
+
+# Merge CE/IM with 2015‑19 average RV & UV
+panel <- dplyr::left_join(shiftshare_scaled, avg_1519, by = "region")
+
+# Helper: fit model, build tidy coefficient table manually (had issues with coeftest)
+run_phase_lm <- function(df, phase_label) {
+  mod <- lm(CE_prop ~ RV_avg + UV_avg + IM_prop, data = df)
+
+  # keep only non‑NA coefficients (lm drops collinear terms)
+  beta <- coef(mod)
+  keep <- !is.na(beta)
+  beta <- beta[keep]
+
+  # robust HC1 covariance matrix, subset to kept coefficients
+  V <- sandwich::vcovHC(mod, type = "HC1")[keep, keep, drop = FALSE]
+  se <- sqrt(diag(V))
+  t  <- beta / se
+  p  <- 2 * pt(abs(t), df = mod$df.residual, lower.tail = FALSE)
+
+  tidy <- data.frame(term = names(beta), estimate = beta,
+                     std.error = se, t.value = t, p.value = p)
+  print(tidy)
+  
+  outfile <- file.path(output_directory,
+                       paste0("ce_rv_results_", phase_label, ".csv"))
+  write.csv(tidy, outfile, row.names = FALSE)
+  message("Saved results to ", outfile)
+
+  list(model = mod, coefs = tidy)
+}
+
+# 2019->20 impact phase
+impact_df <- dplyr::filter(panel, phase == "2019_20")
+impact_res <- run_phase_lm(impact_df, "2019_20")
+
+# 2020->22 rebound phase
+rebound_df <- dplyr::filter(panel, phase == "2020_22")
+rebound_res <- run_phase_lm(rebound_df, "2020_22")
+```
