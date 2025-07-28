@@ -235,6 +235,25 @@ shiftshare_scaled <- shiftshare_results %>%
     NE_prop    = NE / E_start,
     delta_prop = delta_emp / E_start
   )
+
+# Overall dynamic shift-share analysis results 
+dynamic_shiftshare_results <- shiftshare_results %>%
+  group_by(region) %>%
+  summarise(
+    NE_dynamic  = sum(NE, na.rm = TRUE),                #sum of national effects across years
+    IM_dynamic  = sum(IM, na.rm = TRUE),                # sums the industry mix effects
+    CE_dynamic  = sum(CE, na.rm = TRUE),                # sums the competitive effects
+    delta_emp_dynamic = sum(delta_emp, na.rm = TRUE),
+    E_start_2015 = first(E_start),  # First year employment
+    E_end_2022   = last(E_end),     # Final year employment
+    .groups = "drop"
+  ) %>%
+  mutate(
+    CE_prop    = CE_dynamic / E_start_2015, 
+    IM_prop    = IM_dynamic / E_start_2015,
+    NE_prop    = NE_dynamic / E_start_2015,
+    delta_prop = delta_emp_dynamic / E_start_2015
+  )
 ```
 
 #### CE regression ####
