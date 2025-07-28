@@ -220,11 +220,16 @@ compute_shiftshare <- function(df, start_year, end_year, phase_name) {
 }
 
 # run for each phase
-phases <- list(
-  list(s = 2019, e = 2020, name = "2019_20"),
-  list(s = 2020, e = 2022, name = "2020_22")
-)
+#phases <- list(
+#  list(s = 2019, e = 2020, name = "2019_20"),
+#  list(s = 2020, e = 2022, name = "2020_22")
+#)
 
+years <- 2015:2022
+phases <- purrr::map2(
+  years[-length(years)], years[-1],
+  ~list(s = .x, e = .y, name = paste0(.x, "_", .y))
+)
 shiftshare_results <- purrr::map_dfr(phases, ~compute_shiftshare(cleaned_data, .x$s, .x$e, .x$name))
 
 # normalise outputs for regression
